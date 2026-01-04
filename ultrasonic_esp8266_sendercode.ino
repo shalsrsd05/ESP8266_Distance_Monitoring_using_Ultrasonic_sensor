@@ -1,86 +1,102 @@
-import paho.mqtt.client as mqtt
-import mysql.connector
-import json
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
-# ---------------- MQTT Configuration ----------------
-MQTT_BROKER = "broker.emqx.io"
-MQTT_PORT = 1883
-MQTT_TOPIC = "esp8266/ultrasonic"
+// ---------------- Ultrasonic Pins ----------------
+#define TRIG_PIN D5   // GPIO14
+#define ECHO_PIN D6   // GPIO12
 
-# ---------------- MySQL Configuration ----------------
-MYSQL_HOST = "localhost"
-MYSQL_USER = "root"
-MYSQL_PASSWORD = ""
-MYSQL_DATABASE = "ultrasonic_monitoring"
-MYSQL_TABLE = "distance_data"
+// ---------------- WiFi Credentials ----------------
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
 
-# ---------------- Database Initialization ----------------
-def init_db():
-    conn = mysql.connector.connect(
-        host=MYSQL_HOST,
-        user=MYSQL_USER,
-        password=MYSQL_PASSWORD
-    )
-    cur = conn.cursor()
+// ---------------- MQTT Configuration ----------------
+const char* mqtt_server = "broker.emqx.io";
+const int mqtt_port = 1883;
+const char* mqtt_topic = "esp8266/ultrasonic";
 
-    cur.execute(f"CREATE DATABASE IF NOT EXISTS {MYSQL_DATABASE}")
-    conn.database = MYSQL_DATABASE
+// ---------------- MQTT Client ----------------
+WiFiClient espClient;
+PubSubClient client(espClient);
 
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {MYSQL_TABLE} (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            distance_cm FLOAT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+// ---------------- WiFi Setup ----------------
+void setup_wifi() {
+  delay(10);
+  WiFi.begin(ssid, password);
 
-    conn.commit()
-    cur.close()
-    conn.close()
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
 
-# ---------------- MQTT Callbacks ----------------
-def on_connect(client, userdata, flags, reason_code, properties):
-    if reason_code == 0:
-        print("Connected to MQTT Broker")
-        client.subscribe(MQTT_TOPIC)
-    else:
-        print("MQTT Connection Failed:", reason_code)
+  Serial.println("\nWiFi Connected");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
 
-def on_message(client, userdata, msg):
-    data = json.loads(msg.payload.decode())
-    distance = data["distance"]
+// ---------------- MQTT Reconnect ----------------
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Connecting to MQTT...");
+    if (client.connect("ESP8266_Ultrasonic_Client")) {
+      Serial.println("Connected");
+    } else {
+      Serial.print("Failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" retrying in 5 seconds");
+      delay(5000);
+    }
+  }
+}
 
-    print(f"Received → Distance: {distance} cm")
-    save_to_db(distance)
+// ---------------- Measure Distance ----------------
+float measureDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
 
-# ---------------- Save Data to MySQL ----------------
-def save_to_db(distance):
-    conn = mysql.connector.connect(
-        host=MYSQL_HOST,
-        user=MYSQL_USER,
-        password=MYSQL_PASSWORD,
-        database=MYSQL_DATABASE
-    )
-    cur = conn.cursor()
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
 
-    cur.execute(
-        f"INSERT INTO {MYSQL_TABLE} (distance_cm) VALUES (%s)",
-        (distance,)
-    )
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // timeout 30ms
+  float distance = duration * 0.034 / 2;
 
-    conn.commit()
-    cur.close()
-    conn.close()
+  return distance;
+}
 
-# ---------------- Main Program ----------------
-if __name__ == "__main__":
-    init_db()
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(115200);
 
-    client = mqtt.Client(
-        callback_api_version=mqtt.CallbackAPIVersion.VERSION2
-    )
-    client.on_connect = on_connect
-    client.on_message = on_message
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
 
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    client.loop_forever()
+  setup_wifi();
+  client.setServer(mqtt_server, mqtt_port);
+}
+
+// ---------------- Loop ----------------
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  float distance = measureDistance();
+
+  // Create JSON payload
+  StaticJsonDocument<200> doc;
+  doc["distance"] = distance;
+
+  char buffer[128];
+  serializeJson(doc, buffer);
+
+  client.publish(mqtt_topic, buffer);
+
+  Serial.print("Published Distance: ");
+  Serial.print(distance);
+  Serial.println(" cm");
+
+  delay(1000); // Send every 1 second
+}
